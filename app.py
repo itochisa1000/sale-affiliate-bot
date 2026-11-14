@@ -26,16 +26,17 @@ ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 8つのカテゴリー定義
+# 9つのカテゴリー定義
 CATEGORIES = [
     "お米", 
     "飲料", 
-    "ベビー・キッズ", 
-    "お酒", 
-    "日用品", 
-    "美容・コスメ", 
     "グルメ", 
-    "キッチン用品"
+    "日用品", 
+    "キッチン用品",
+    "ベビー・キッズ", 
+    "美容・コスメ", 
+    "健康食品",
+    "お酒"
 ]
 
 def init_db():
@@ -65,15 +66,28 @@ def get_user_categories(user_id):
     conn.close()
     return [row[0] for row in rows]
 
+# カテゴリーごとの表示用絵文字マップ
+CATEGORY_EMOJIS = {
+    "お米": "🌾お米",
+    "飲料": "🥤飲料",
+    "グルメ": "🥩グルメ🍰",
+    "日用品": "🧻日用品",
+    "キッチン用品": "🍳キッチン用品",
+    "ベビー・キッズ": "👶ベビー・キッズ",
+    "美容・コスメ": "💄美容・コスメ",
+    "健康食品": "💊健康食品",
+    "お酒": "🍺お酒"
+}
+
 def create_category_flex_message(user_id):
     """ 現在の登録状態を反映したカテゴリー選択Flex Messageを生成する関数 """
     current_categories = get_user_categories(user_id)
     
     buttons = []
     for cat in CATEGORIES:
-        # すでに登録されているカテゴリーはラベルに「✅」をつけるなどの工夫も可能
         is_registered = cat in current_categories
-        label_text = f"✅ {cat}" if is_registered else cat
+        disp_name = CATEGORY_EMOJIS.get(cat, cat)
+        label_text = f"✅ {disp_name}" if is_registered else disp_name
         
         buttons.append(
             ButtonComponent(
@@ -108,6 +122,7 @@ def create_category_flex_message(user_id):
     return FlexSendMessage(alt_text="カテゴリー選択メニュー", contents=bubble)
 
 
+
 @app.route("/callback", methods=['POST'])
 def callback():
     signature = request.headers['X-Line-Signature']
@@ -127,23 +142,46 @@ def handle_message(event):
     received_text = event.message.text
     user_id = event.source.user_id
     
-     # 管理者からの「配信」コマンド処理
+        # 管理者からの「配信」コマンド処理
     if user_id == ADMIN_USER_ID and received_text.startswith("配信"):
         lines = [line.strip() for line in received_text.splitlines() if line.strip()]
         if len(lines) >= 5:
-            category = lines[1]
+            cat_and_site = lines[1].replace("　", " ").split(" ", 1)
+            category = cat_and_site[0]
+            site_name = cat_and_site[1].strip() if len(cat_and_site) > 1 else ""
             title = lines[2]
             price_info = lines[3]
             url = lines[4]
             if category in CATEGORIES:
-                sent_count = broadcast_deal_to_category(category, title, price_info, url)
-                reply_text = f"📢【配信完了】\n「{category}」の登録者 {sent_count} 名に一斉送信しました！"
+                sent_count = broadcast_deal_to_category(category, title, price_info, url, site_name)
+                site_disp = f"（{site_name}）" if site_name else ""
+                reply_text = f"📢【配信完了】\n「{category}」{site_disp}の登録者 {sent_count} 名に一斉送信しました！"
             else:
                 reply_text = f"⚠️ カテゴリー名「{category}」が正しくありません。\n以下から選んでください：\n" + "、".join(CATEGORIES)
         else:
             reply_text = (
                 "⚠️ 入力形式が足りません。以下の5行で送ってください：\n\n"
-                "配信\nカテゴリー名\n商品タイトル\n価格・割引情報\n商品URL"
+                "配信\nカテゴリー名 サイト名\n商品タイトル\n価格・割引情報\n商品URL\n\n（※サイト名は省略もできます）"
+            )
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        return
+    
+    # 管理者からの「自由配信」コマンド処理
+    if user_id == ADMIN_USER_ID and received_text.startswith("自由配信"):
+        lines = received_text.splitlines()
+        if len(lines) >= 3:
+            target_category = lines[1].strip()
+            message_body = "\n".join(lines[2:]).strip()
+            if target_category == "全員" or target_category in CATEGORIES:
+                sent_count = broadcast_free_message(target_category, message_body)
+                count_text = sent_count if isinstance(sent_count, str) else f"{sent_count} 名"
+                reply_text = f"📢【自由配信完了】\n「{target_category}」の対象者（{count_text}）に一斉送信しました！"
+            else:
+                reply_text = f"⚠️ 対象「{target_category}」が正しくありません。「全員」または以下から選んでください：\n" + "、".join(CATEGORIES)
+        else:
+            reply_text = (
+                "⚠️ 入力形式が足りません。以下の3行以上で送ってください：\n\n"
+                "自由配信\n全員（またはカテゴリー名）\n送りたい自由なメッセージ本文..."
             )
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
         return
@@ -226,7 +264,7 @@ def handle_postback(event):
             event.reply_token,
             TextSendMessage(text=reply_text)
         )
-def broadcast_deal_to_category(category, title, price_info, url):
+def broadcast_deal_to_category(category, title, price_info, url, site_name=""):
     """ 指定カテゴリーを登録している全ユーザーにセール情報を一斉送信する関数 """
     conn = sqlite3.connect('otoku.db')
     cursor = conn.cursor()
@@ -237,16 +275,38 @@ def broadcast_deal_to_category(category, title, price_info, url):
     if not target_users:
         return 0
 
+    # サイト名が指定されていれば「Amazonで詳細・購入する」、なければ「詳細・購入はこちら」にする
+    if site_name:
+        link_label = f"👇 {site_name}で詳細・購入する"
+    else:
+        link_label = "👇 詳細・購入はこちら"
+
     message_text = (
-        f"🔥【{category}の超お得情報！】\n\n"
+        f"🔥【{category}が安い！】\n\n"
         f"📦 {title}\n"
         f"💰 {price_info}\n\n"
-        f"👇 詳細・購入はこちら\n{url}"
+        f"{link_label}\n{url}"
     )
 
     # LINEのmulticast機能で対象者全員に一斉プッシュ送信
     line_bot_api.multicast(target_users, TextSendMessage(text=message_text))
     return len(target_users)
+
+def broadcast_free_message(target_category, message_body):
+    """ 指定カテゴリー（または「全員」）に自由な文章を一斉送信する関数 """
+    if target_category == "全員":
+        line_bot_api.broadcast(TextSendMessage(text=message_body))
+        return "友だち全員"
+    conn = sqlite3.connect('otoku.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT DISTINCT user_id FROM user_categories WHERE category = ?', (target_category,))
+    target_users = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    if not target_users:
+        return 0
+    line_bot_api.multicast(target_users, TextSendMessage(text=message_body))
+    return len(target_users)
+
 
 ADMIN_HTML = """
 <!DOCTYPE html>
@@ -257,54 +317,96 @@ ADMIN_HTML = """
     <title>お得速報 管理者配信パネル</title>
     <style>
         body { font-family: sans-serif; max-width: 500px; margin: 40px auto; padding: 20px; background: #f9f9f9; }
-        .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-        h2 { color: #333; margin-top: 0; }
+        .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 25px; }
+        h2 { color: #333; margin-top: 0; font-size: 20px; }
         label { display: block; margin-top: 15px; font-weight: bold; color: #555; }
-        select, input { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; }
-        button { width: 100%; padding: 12px; margin-top: 25px; background: #06C755; color: white; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer; }
+        select, input, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; font-family: inherit; }
+        button { width: 100%; padding: 12px; margin-top: 20px; background: #06C755; color: white; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer; }
         button:hover { background: #05b34c; }
-        .msg { padding: 12px; background: #e8f8ee; color: #058a3a; border-radius: 5px; margin-bottom: 15px; font-weight: bold; }
+        .btn-blue { background: #007bff; }
+        .btn-blue:hover { background: #0069d9; }
+        .msg { padding: 12px; background: #e8f8ee; color: #058a3a; border-radius: 5px; margin-bottom: 20px; font-weight: bold; }
     </style>
 </head>
 <body>
+    {% if result_msg %}
+        <div class="msg">{{ result_msg }}</div>
+    {% endif %}
+
     <div class="card">
-        <h2>📢 お得速報 配信パネル</h2>
-        {% if result_msg %}
-            <div class="msg">{{ result_msg }}</div>
-        {% endif %}
+        <h2>📢 商品セール配信（定型フォーマット）</h2>
         <form method="POST">
+            <input type="hidden" name="form_type" value="deal">
             <label>① 配信するカテゴリー</label>
             <select name="category" required>
                 {% for cat in categories %}
                     <option value="{{ cat }}">{{ cat }}</option>
                 {% endfor %}
             </select>
-            <label>② 商品タイトル</label>
+            <label>② 購入サイト</label>
+            <select name="site_name">
+                <option value="Amazon">Amazon</option>
+                <option value="楽天市場">楽天市場</option>
+                <option value="Yahoo!ショッピング">Yahoo!ショッピング</option>
+                <option value="">表記なし（その他）</option>
+            </select>
+            <label>③ 商品タイトル</label>
             <input type="text" name="title" placeholder="例：無洗米 あきたこまち 5kg" required>
-            <label>③ セール価格・割引情報</label>
+            <label>④ セール価格・割引情報</label>
             <input type="text" name="price_info" placeholder="例：通常4,500円 → 2,980円（33%OFF!）" required>
-            <label>④ アフィリエイトリンク（URL）</label>
+            <label>⑤ アフィリエイトリンク（URL）</label>
             <input type="url" name="url" placeholder="https://..." required>
-            <button type="submit">このカテゴリーの登録者に一斉配信する</button>
+            <button type="submit">商品セールを一斉配信する</button>
+        </form>
+    </div>
+
+    <div class="card">
+        <h2>📝 自由文・お知らせ配信（クーポン・イベント速報）</h2>
+        <form method="POST">
+            <input type="hidden" name="form_type" value="free">
+            <label>① 配信対象</label>
+            <select name="target_category" required>
+                <option value="全員">全員（友だち追加している人すべて）</option>
+                {% for cat in categories %}
+                    <option value="{{ cat }}">{{ cat }} の登録者のみ</option>
+                {% endfor %}
+            </select>
+            <label>② メッセージ本文（改行・絵文字・URL自由）</label>
+            <textarea name="message_body" rows="6" placeholder="例：本日20時から楽天で半額クーポンが出ます！&#10;今のうちにゲットしておきましょう👇&#10;https://..." required></textarea>
+            <button type="submit" class="btn-blue">自由メッセージを一斉配信する</button>
         </form>
     </div>
 </body>
 </html>
 """
 
-@app.route("/admin", methods=['GET', 'POST'])
+@app.route("/otoku-haishin-821", methods=['GET', 'POST'])
 def admin_panel():
     result_msg = None
     if request.method == 'POST':
-        category = request.form.get('category')
-        title = request.form.get('title')
-        price_info = request.form.get('price_info')
-        url = request.form.get('url')
+        form_type = request.form.get('form_type')
         
-        sent_count = broadcast_deal_to_category(category, title, price_info, url)
-        result_msg = f"✅「{category}」を登録している {sent_count} 名に配信しました！"
+        if form_type == 'deal':
+            category = request.form.get('category')
+            site_name = request.form.get('site_name', '')
+            title = request.form.get('title')
+            price_info = request.form.get('price_info')
+            url = request.form.get('url')
+            
+            sent_count = broadcast_deal_to_category(category, title, price_info, url, site_name)
+            site_disp = f"（{site_name}）" if site_name else ""
+            result_msg = f"✅「{category}」{site_disp}を登録している {sent_count} 名に商品セールを配信しました！"
+            
+        elif form_type == 'free':
+            target_category = request.form.get('target_category')
+            message_body = request.form.get('message_body')
+            
+            sent_count = broadcast_free_message(target_category, message_body)
+            count_text = sent_count if isinstance(sent_count, str) else f"{sent_count} 名"
+            result_msg = f"✅「{target_category}」の対象者（{count_text}）に自由メッセージを配信しました！"
         
     return render_template_string(ADMIN_HTML, categories=CATEGORIES, result_msg=result_msg)
+
 
 if __name__ == "__main__":
     app.run(port=5000)

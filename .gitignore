@@ -1,4 +1,6 @@
+LINE_CHANNEL.env
 *.env
+otoku.db
 __pycache__/
-/bin/
-*.db
+*.pyc
+.venv/

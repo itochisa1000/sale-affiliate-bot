@@ -1,72 +1,60 @@
 import os
+import hmac
+import secrets
 import sqlite3
-from flask import Flask, request, abort, render_template_string
-from linebot import (
-    LineBotApi, WebhookHandler
+import logging
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from functools import wraps
+from urllib.parse import parse_qs, urlencode
+
+from flask import (
+    Flask, request, abort, render_template, Response,
+    redirect, url_for, flash, session
 )
-from linebot.exceptions import (
-    InvalidSignatureError
-)
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError, LineBotApiError
 from linebot.models import (
     MessageEvent, TextMessage, TextSendMessage,
-    PostbackEvent, FollowEvent, FlexSendMessage,
-    BubbleContainer, BoxComponent, TextComponent, ButtonComponent, PostbackAction
+    PostbackEvent, FollowEvent, UnfollowEvent, FlexSendMessage,
+    BubbleContainer, BoxComponent, TextComponent, ButtonComponent,
+    PostbackAction
 )
 from dotenv import load_dotenv
 
-# .envファイル（LINE_CHANNEL.env）から認証情報を読み込む
+# ---------------------------------------------------------------
+# 設定
+# ---------------------------------------------------------------
 load_dotenv('LINE_CHANNEL.env')
-
-app = Flask(__name__)
 
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN')
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET')
-ADMIN_USER_ID = os.environ.get('ADMIN_USER_ID')
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD')
+ADMIN_USERNAME = os.environ.get('ADMIN_USERNAME', 'admin')
+
+if not LINE_CHANNEL_ACCESS_TOKEN or not LINE_CHANNEL_SECRET:
+    raise RuntimeError('LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET が未設定です')
+
+app = Flask(__name__)
+app.secret_key = os.environ.get('FLASK_SECRET_KEY') or os.urandom(24)
+
+logging.basicConfig(level=logging.INFO)
+logger = app.logger
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 9つのカテゴリー定義
+DB_PATH = 'otoku.db'
+MULTICAST_LIMIT = 500        # LINE multicastの1回あたり上限
+LINE_TEXT_MAX = 5000         # LINEテキストメッセージの最大文字数
+JST = timezone(timedelta(hours=9))
+ALL_CONFIRM_WORD = "全員"     # 全員配信時に入力させる確認ワード
+
 CATEGORIES = [
-    "お米", 
-    "飲料", 
-    "グルメ", 
-    "日用品", 
-    "キッチン用品",
-    "ベビー・キッズ", 
-    "美容・コスメ", 
-    "健康食品",
-    "お酒"
+    "お米", "飲料", "グルメ", "日用品", "キッチン用品",
+    "ベビー・キッズ", "美容・コスメ", "健康食品", "お酒"
 ]
 
-def init_db():
-    """ 起動時にデータベースとテーブルを自動作成する関数 """
-    conn = sqlite3.connect('otoku.db')
-    cursor = conn.cursor()
-    # ユーザーIDとカテゴリーを保存するテーブル
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS user_categories (
-            user_id TEXT,
-            category TEXT,
-            PRIMARY KEY (user_id, category)
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-# アプリ起動時にDBを初期化
-init_db()
-
-def get_user_categories(user_id):
-    """ 指定したユーザーが現在登録しているカテゴリーのリストを取得する関数 """
-    conn = sqlite3.connect('otoku.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT category FROM user_categories WHERE user_id = ?', (user_id,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in rows]
-
-# カテゴリーごとの表示用絵文字マップ
 CATEGORY_EMOJIS = {
     "お米": "🌾お米",
     "飲料": "🥤飲料",
@@ -79,334 +67,533 @@ CATEGORY_EMOJIS = {
     "お酒": "🍺お酒"
 }
 
+SITES = ["Amazon", "楽天市場", "Yahoo!ショッピング"]
+
+
+# ---------------------------------------------------------------
+# データベース
+# ---------------------------------------------------------------
+@contextmanager
+def get_conn():
+    """ 自動でcommit/rollback/closeするDB接続 """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def init_db():
+    with get_conn() as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS user_categories (
+                user_id TEXT,
+                category TEXT,
+                PRIMARY KEY (user_id, category)
+            )
+        ''')
+        # 友だち全員のテーブル（カテゴリー未選択の人も含む）
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT (datetime('now', 'localtime'))
+            )
+        ''')
+        # 配信履歴
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sent_at TEXT DEFAULT (datetime('now', 'localtime')),
+                kind TEXT,
+                target TEXT,
+                site_name TEXT,
+                title TEXT,
+                body TEXT,
+                url TEXT,
+                success_count INTEGER,
+                failed_count INTEGER
+            )
+        ''')
+        # 既存のカテゴリー登録者をusersへ移行
+        conn.execute(
+            'INSERT OR IGNORE INTO users (user_id) '
+            'SELECT DISTINCT user_id FROM user_categories'
+        )
+
+
+init_db()
+
+
+def ensure_user(user_id):
+    """ 何かイベントが来た時点でusersに登録（既存の友だちの取りこぼし対策） """
+    if not user_id:
+        return
+    with get_conn() as conn:
+        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+
+
+def delete_user(user_id):
+    with get_conn() as conn:
+        conn.execute('DELETE FROM user_categories WHERE user_id = ?', (user_id,))
+        conn.execute('DELETE FROM users WHERE user_id = ?', (user_id,))
+
+
+def count_users():
+    with get_conn() as conn:
+        return conn.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+
+
+def get_user_categories(user_id):
+    with get_conn() as conn:
+        rows = conn.execute(
+            'SELECT category FROM user_categories WHERE user_id = ?', (user_id,)
+        ).fetchall()
+    registered = {r[0] for r in rows}
+    return [c for c in CATEGORIES if c in registered]
+
+
+def get_users_for_categories(categories):
+    """ 指定カテゴリーのいずれかを登録しているユーザー（重複なし） """
+    if not categories:
+        return []
+    placeholders = ",".join("?" * len(categories))
+    with get_conn() as conn:
+        rows = conn.execute(
+            f'SELECT DISTINCT user_id FROM user_categories WHERE category IN ({placeholders})',
+            categories
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def toggle_category(user_id, category):
+    """ 登録なら解除、未登録なら登録。登録後の状態(True=登録)を返す """
+    with get_conn() as conn:
+        conn.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        exists = conn.execute(
+            'SELECT 1 FROM user_categories WHERE user_id = ? AND category = ?',
+            (user_id, category)
+        ).fetchone()
+        if exists:
+            conn.execute(
+                'DELETE FROM user_categories WHERE user_id = ? AND category = ?',
+                (user_id, category)
+            )
+            return False
+        conn.execute(
+            'INSERT INTO user_categories (user_id, category) VALUES (?, ?)',
+            (user_id, category)
+        )
+        return True
+
+
+def save_delivery(kind, target, site_name, title, body, url, success, failed):
+    with get_conn() as conn:
+        conn.execute('''
+            INSERT INTO deliveries
+                (kind, target, site_name, title, body, url, success_count, failed_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (kind, target, site_name, title, body, url, success, failed))
+
+
+def get_recent_deliveries(limit=10):
+    with get_conn() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            'SELECT * FROM deliveries ORDER BY id DESC LIMIT ?', (limit,)
+        ).fetchall()
+    return rows
+
+
+# ---------------------------------------------------------------
+# LINE API：通数・友だち数
+# ---------------------------------------------------------------
+def get_quota_info():
+    """ 今月の上限・送信済み・残り通数をLINEのAPIから取得 """
+    try:
+        quota = line_bot_api.get_message_quota()
+        consumption = line_bot_api.get_message_quota_consumption()
+        used = consumption.total_usage
+        if quota.type == 'limited':
+            limit = quota.value
+            return {'ok': True, 'unlimited': False, 'limit': limit,
+                    'used': used, 'remaining': max(limit - used, 0)}
+        return {'ok': True, 'unlimited': True, 'limit': None,
+                'used': used, 'remaining': None}
+    except Exception as e:
+        logger.error("通数の取得に失敗: %s", e)
+        return {'ok': False}
+
+
+def estimate_all_count():
+    """ 全員配信の見積人数。usersの人数と友だち数API（前日分）の大きいほうを採用 """
+    db_count = count_users()
+    api_count = None
+    try:
+        yesterday = (datetime.now(JST) - timedelta(days=1)).strftime('%Y%m%d')
+        res = line_bot_api.get_insight_followers(yesterday)
+        if res.status == 'ready' and res.followers is not None:
+            api_count = res.followers
+    except Exception as e:
+        logger.warning("友だち数APIの取得に失敗: %s", e)
+    return max(db_count, api_count or 0), db_count, api_count
+
+
+# ---------------------------------------------------------------
+# Flex Message
+# ---------------------------------------------------------------
 def create_category_flex_message(user_id):
-    """ 現在の登録状態を反映したカテゴリー選択Flex Messageを生成する関数 """
-    current_categories = get_user_categories(user_id)
-    
-    buttons = []
+    current = get_user_categories(user_id)
+
+    contents = [
+        TextComponent(
+            text="受け取りたいお得情報のカテゴリーを選んでね！（タップで登録/解除）",
+            weight="bold", size="xs", wrap=True, margin="md"
+        )
+    ]
     for cat in CATEGORIES:
-        is_registered = cat in current_categories
-        disp_name = CATEGORY_EMOJIS.get(cat, cat)
-        label_text = f"✅ {disp_name}" if is_registered else disp_name
-        
-        buttons.append(
+        disp = CATEGORY_EMOJIS.get(cat, cat)
+        label = f"✅ {disp}" if cat in current else disp
+        contents.append(
             ButtonComponent(
                 style="secondary",
                 height="sm",
                 action=PostbackAction(
-                    label=label_text,
-                    data=f"action=toggle_category&category={cat}"
+                    label=label,
+                    data=urlencode({"action": "toggle_category", "category": cat})
                 )
             )
         )
-        
-    box_contents = [
-        TextComponent(
-            text="受け取りたいお得情報のカテゴリーを選んでね！（タップで登録/解除）", 
-            weight="bold", 
-            size="xs", 
-            wrap=True, 
-            margin="md"
-        )
-    ]
-    for btn in buttons:
-        box_contents.append(btn)
 
     bubble = BubbleContainer(
-        body=BoxComponent(
-            layout="vertical",
-            contents=box_contents,
-            spacing="sm"
-        )
+        body=BoxComponent(layout="vertical", contents=contents, spacing="sm")
     )
     return FlexSendMessage(alt_text="カテゴリー選択メニュー", contents=bubble)
 
 
-
+# ---------------------------------------------------------------
+# LINE Webhook
+# ---------------------------------------------------------------
 @app.route("/callback", methods=['POST'])
 def callback():
-    signature = request.headers['X-Line-Signature']
+    signature = request.headers.get('X-Line-Signature', '')
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    logger.info("Webhook received")
 
     try:
         handler.handle(body, signature)
     except InvalidSignatureError:
         abort(400)
-
     return 'OK'
 
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    received_text = event.message.text
+    text = event.message.text
     user_id = event.source.user_id
-    
-        # 管理者からの「配信」コマンド処理
-    if user_id == ADMIN_USER_ID and received_text.startswith("配信"):
-        lines = [line.strip() for line in received_text.splitlines() if line.strip()]
-        if len(lines) >= 5:
-            cat_and_site = lines[1].replace("　", " ").split(" ", 1)
-            category = cat_and_site[0]
-            site_name = cat_and_site[1].strip() if len(cat_and_site) > 1 else ""
-            title = lines[2]
-            price_info = lines[3]
-            url = lines[4]
-            if category in CATEGORIES:
-                sent_count = broadcast_deal_to_category(category, title, price_info, url, site_name)
-                site_disp = f"（{site_name}）" if site_name else ""
-                reply_text = f"📢【配信完了】\n「{category}」{site_disp}の登録者 {sent_count} 名に一斉送信しました！"
-            else:
-                reply_text = f"⚠️ カテゴリー名「{category}」が正しくありません。\n以下から選んでください：\n" + "、".join(CATEGORIES)
-        else:
-            reply_text = (
-                "⚠️ 入力形式が足りません。以下の5行で送ってください：\n\n"
-                "配信\nカテゴリー名 サイト名\n商品タイトル\n価格・割引情報\n商品URL\n\n（※サイト名は省略もできます）"
-            )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-        return
-    
-    # 管理者からの「自由配信」コマンド処理
-    if user_id == ADMIN_USER_ID and received_text.startswith("自由配信"):
-        lines = received_text.splitlines()
-        if len(lines) >= 3:
-            target_category = lines[1].strip()
-            message_body = "\n".join(lines[2:]).strip()
-            if target_category == "全員" or target_category in CATEGORIES:
-                sent_count = broadcast_free_message(target_category, message_body)
-                count_text = sent_count if isinstance(sent_count, str) else f"{sent_count} 名"
-                reply_text = f"📢【自由配信完了】\n「{target_category}」の対象者（{count_text}）に一斉送信しました！"
-            else:
-                reply_text = f"⚠️ 対象「{target_category}」が正しくありません。「全員」または以下から選んでください：\n" + "、".join(CATEGORIES)
-        else:
-            reply_text = (
-                "⚠️ 入力形式が足りません。以下の3行以上で送ってください：\n\n"
-                "自由配信\n全員（またはカテゴリー名）\n送りたい自由なメッセージ本文..."
-            )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-        return
+    ensure_user(user_id)
 
+    if "カテゴリー" in text or "設定" in text or "メニュー" in text:
+        line_bot_api.reply_message(event.reply_token, create_category_flex_message(user_id))
 
-    if "カテゴリー" in received_text or "設定" in received_text or "メニュー" in received_text:
-        flex_msg = create_category_flex_message(user_id)
-        line_bot_api.reply_message(event.reply_token, flex_msg)
-    elif "確認" in received_text:
-        current_list = get_user_categories(user_id)
-        if current_list:
-            list_text = "\n".join([f"・{cat}" for cat in current_list])
-            reply_text = f"📋 現在登録中のカテゴリー：\n\n{list_text}\n\n変更したい場合は「設定」と送ってね！"
+    elif "確認" in text:
+        current = get_user_categories(user_id)
+        if current:
+            list_text = "\n".join(f"・{c}" for c in current)
+            reply = f"📋 現在登録中のカテゴリー：\n\n{list_text}\n\n変更したい場合は「設定」と送ってね！"
         else:
-            reply_text = "現在登録されているカテゴリーはありません。\n下のメニューから「配信カテゴリー選択・変更」を押して登録してね！"
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-    elif "ヘルプ" in received_text or "使い方" in received_text or "質問" in received_text:
-        reply_text = (
+            reply = "現在登録されているカテゴリーはありません。\n下のメニューから「配信カテゴリー選択・変更」を押して登録してね！"
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
+    elif "ヘルプ" in text or "使い方" in text or "質問" in text:
+        reply = (
             "💡【お得速報の使い方】\n\n"
             "1️⃣ 下のメニュー「配信カテゴリー選択・変更」から、欲しいセール情報のジャンルを選びます。\n"
             "2️⃣ 選んだジャンルのセールが開催されたときだけ、LINEで通知が届きます！\n"
             "3️⃣ もう一度同じボタンをタップすると解除できます。"
         )
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
+
     else:
         line_bot_api.reply_message(
             event.reply_token,
-            TextSendMessage(text=f"「{received_text}」を受け取りました！\n\n下のメニューから「配信カテゴリー選択・変更」を押すと、お好みのジャンルを選べます。")
+            TextSendMessage(
+                text=f"「{text}」を受け取りました！\n\n下のメニューから「配信カテゴリー選択・変更」を押すと、お好みのジャンルを選べます。"
+            )
         )
 
 
 @handler.add(FollowEvent)
 def handle_follow(event):
     user_id = event.source.user_id
-    welcome_text = TextSendMessage(
-        text="友だち追加ありがとうございます！🎉\n\nこのアカウントでは、あなたが選んだジャンルのお得なセール情報だけを厳選してお届けします。\n\nまずは下のボタンから、受け取りたいカテゴリーを選んでね！"
+    ensure_user(user_id)
+    welcome = TextSendMessage(
+        text=(
+            "友だち追加ありがとうございます！🎉\n\n"
+            "このアカウントでは、あなたが選んだジャンルのお得なセール情報だけを厳選してお届けします。\n\n"
+            "まずは下のボタンから、受け取りたいカテゴリーを選んでね！"
+        )
     )
-    flex_msg = create_category_flex_message(user_id)
-    line_bot_api.reply_message(event.reply_token, [welcome_text, flex_msg])
+    line_bot_api.reply_message(
+        event.reply_token, [welcome, create_category_flex_message(user_id)]
+    )
+
+
+@handler.add(UnfollowEvent)
+def handle_unfollow(event):
+    """ ブロック・友だち解除されたらユーザーデータを削除 """
+    delete_user(event.source.user_id)
 
 
 @handler.add(PostbackEvent)
 def handle_postback(event):
-    data = event.postback.data
-    params = dict(item.split('=') for item in data.split('&'))
-    
-    if params.get('action') == 'toggle_category':
-        selected_category = params.get('category')
-        user_id = event.source.user_id
-        
-        conn = sqlite3.connect('otoku.db')
-        cursor = conn.cursor()
-        
-        # すでに登録されているかチェック
-        cursor.execute('SELECT 1 FROM user_categories WHERE user_id = ? AND category = ?', (user_id, selected_category))
-        exists = cursor.fetchone()
-        
-        if exists:
-            # 登録済みなら削除（解除）
-            cursor.execute('DELETE FROM user_categories WHERE user_id = ? AND category = ?', (user_id, selected_category))
-            msg_status = f"🗑️「{selected_category}」の登録を解除しました！"
-        else:
-            # 未登録なら追加（登録）
-            cursor.execute('INSERT INTO user_categories (user_id, category) VALUES (?, ?)', (user_id, selected_category))
-            msg_status = f"✅「{selected_category}」を登録しました！"
-            
-        conn.commit()
-        conn.close()
-        
-        # 現在の登録中リストを取得
-        current_list = get_user_categories(user_id)
-        if current_list:
-            list_text = "、".join(current_list)
-        else:
-            list_text = "なし（未選択）"
-            
-        reply_text = f"{msg_status}\n\n📋 現在の登録中：{list_text}"
-        
-        line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text=reply_text)
-        )
-def broadcast_deal_to_category(category, title, price_info, url, site_name=""):
-    """ 指定カテゴリーを登録している全ユーザーにセール情報を一斉送信する関数 """
-    conn = sqlite3.connect('otoku.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT user_id FROM user_categories WHERE category = ?', (category,))
-    target_users = [row[0] for row in cursor.fetchall()]
-    conn.close()
+    params = {k: v[0] for k, v in parse_qs(event.postback.data).items()}
 
-    if not target_users:
-        return 0
+    if params.get('action') != 'toggle_category':
+        return
 
-    # サイト名が指定されていれば「Amazonで詳細・購入する」、なければ「詳細・購入はこちら」にする
-    if site_name:
-        link_label = f"👇 {site_name}で詳細・購入する"
+    category = params.get('category')
+    if category not in CATEGORIES:
+        return
+
+    user_id = event.source.user_id
+    registered = toggle_category(user_id, category)
+    if registered:
+        status = f"✅「{category}」を登録しました！"
     else:
-        link_label = "👇 詳細・購入はこちら"
+        status = f"🗑️「{category}」の登録を解除しました！"
 
-    message_text = (
-        f"🔥【{category}が安い！】\n\n"
+    current = get_user_categories(user_id)
+    list_text = "、".join(current) if current else "なし（未選択）"
+
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f"{status}\n\n📋 現在登録中：{list_text}")
+    )
+
+
+# ---------------------------------------------------------------
+# 配信ロジック
+# ---------------------------------------------------------------
+def chunked(items, n=MULTICAST_LIMIT):
+    for i in range(0, len(items), n):
+        yield items[i:i + n]
+
+
+def send_to_users(user_ids, text):
+    """ 500人ずつ分割してmulticast。(成功数, 失敗数) を返す """
+    success = failed = 0
+    for chunk in chunked(user_ids):
+        try:
+            line_bot_api.multicast(chunk, TextSendMessage(text=text))
+            success += len(chunk)
+        except LineBotApiError as e:
+            failed += len(chunk)
+            logger.error("multicast失敗: status=%s message=%s", e.status_code, e.message)
+    return success, failed
+
+
+def build_deal_text(category, title, price_info, url, site_name=""):
+    link_label = f"👇 {site_name}で詳細・購入する" if site_name else "👇 詳細・購入はこちら"
+    return (
+        f"【PR】🔥【{category}が安い！】\n\n"
         f"📦 {title}\n"
-        f"💰 {price_info}\n\n"
+        f"💰 {price_info}\n"
+        f"※価格は配信時点のものです。\n\n"
         f"{link_label}\n{url}"
     )
 
-    # LINEのmulticast機能で対象者全員に一斉プッシュ送信
-    line_bot_api.multicast(target_users, TextSendMessage(text=message_text))
-    return len(target_users)
 
-def broadcast_free_message(target_category, message_body):
-    """ 指定カテゴリー（または「全員」）に自由な文章を一斉送信する関数 """
-    if target_category == "全員":
-        line_bot_api.broadcast(TextSendMessage(text=message_body))
-        return "友だち全員"
-    conn = sqlite3.connect('otoku.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT DISTINCT user_id FROM user_categories WHERE category = ?', (target_category,))
-    target_users = [row[0] for row in cursor.fetchall()]
-    conn.close()
-    if not target_users:
-        return 0
-    line_bot_api.multicast(target_users, TextSendMessage(text=message_body))
-    return len(target_users)
+def deliver(plan):
+    """ 確認済みの配信プランを実行し、履歴を保存。(成功数 or None, 失敗数) """
+    meta = plan['meta']
+    if plan['user_ids'] is None:   # 全員配信
+        try:
+            line_bot_api.broadcast(TextSendMessage(text=plan['text']))
+            success, failed = None, 0
+        except LineBotApiError as e:
+            logger.error("broadcast失敗: status=%s message=%s", e.status_code, e.message)
+            success, failed = 0, 1
+    else:
+        success, failed = send_to_users(plan['user_ids'], plan['text'])
+
+    save_delivery(plan['kind'], plan['target_label'], meta.get('site_name', ''),
+                  meta.get('title', ''), meta.get('body', ''), meta.get('url', ''),
+                  success, failed)
+    return success, failed
 
 
-ADMIN_HTML = """
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>お得速報 管理者配信パネル</title>
-    <style>
-        body { font-family: sans-serif; max-width: 500px; margin: 40px auto; padding: 20px; background: #f9f9f9; }
-        .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 25px; }
-        h2 { color: #333; margin-top: 0; font-size: 20px; }
-        label { display: block; margin-top: 15px; font-weight: bold; color: #555; }
-        select, input, textarea { width: 100%; padding: 10px; margin-top: 5px; border: 1px solid #ccc; border-radius: 5px; box-sizing: border-box; font-size: 16px; font-family: inherit; }
-        button { width: 100%; padding: 12px; margin-top: 20px; background: #06C755; color: white; border: none; border-radius: 5px; font-size: 16px; font-weight: bold; cursor: pointer; }
-        button:hover { background: #05b34c; }
-        .btn-blue { background: #007bff; }
-        .btn-blue:hover { background: #0069d9; }
-        .msg { padding: 12px; background: #e8f8ee; color: #058a3a; border-radius: 5px; margin-bottom: 20px; font-weight: bold; }
-    </style>
-</head>
-<body>
-    {% if result_msg %}
-        <div class="msg">{{ result_msg }}</div>
-    {% endif %}
+# ---------------------------------------------------------------
+# 管理画面
+# ---------------------------------------------------------------
+def require_auth(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not ADMIN_PASSWORD:
+            return Response('ADMIN_PASSWORD が設定されていません', 503)
+        auth = request.authorization
+        ok = (
+            auth is not None
+            and hmac.compare_digest(auth.username or '', ADMIN_USERNAME)
+            and hmac.compare_digest(auth.password or '', ADMIN_PASSWORD)
+        )
+        if not ok:
+            return Response('認証が必要です', 401,
+                            {'WWW-Authenticate': 'Basic realm="Admin"'})
+        return f(*args, **kwargs)
+    return wrapper
 
-    <div class="card">
-        <h2>📢 商品セール配信（定型フォーマット）</h2>
-        <form method="POST">
-            <input type="hidden" name="form_type" value="deal">
-            <label>① 配信するカテゴリー</label>
-            <select name="category" required>
-                {% for cat in categories %}
-                    <option value="{{ cat }}">{{ cat }}</option>
-                {% endfor %}
-            </select>
-            <label>② 購入サイト</label>
-            <select name="site_name">
-                <option value="Amazon">Amazon</option>
-                <option value="楽天市場">楽天市場</option>
-                <option value="Yahoo!ショッピング">Yahoo!ショッピング</option>
-                <option value="">表記なし（その他）</option>
-            </select>
-            <label>③ 商品タイトル</label>
-            <input type="text" name="title" placeholder="例：無洗米 あきたこまち 5kg" required>
-            <label>④ セール価格・割引情報</label>
-            <input type="text" name="price_info" placeholder="例：通常4,500円 → 2,980円（33%OFF!）" required>
-            <label>⑤ アフィリエイトリンク（URL）</label>
-            <input type="url" name="url" placeholder="https://..." required>
-            <button type="submit">商品セールを一斉配信する</button>
-        </form>
-    </div>
 
-    <div class="card">
-        <h2>📝 自由文・お知らせ配信（クーポン・イベント速報）</h2>
-        <form method="POST">
-            <input type="hidden" name="form_type" value="free">
-            <label>① 配信対象</label>
-            <select name="target_category" required>
-                <option value="全員">全員（友だち追加している人すべて）</option>
-                {% for cat in categories %}
-                    <option value="{{ cat }}">{{ cat }} の登録者のみ</option>
-                {% endfor %}
-            </select>
-            <label>② メッセージ本文（改行・絵文字・URL自由）</label>
-            <textarea name="message_body" rows="6" placeholder="例：本日20時から楽天で半額クーポンが出ます！&#10;今のうちにゲットしておきましょう👇&#10;https://..." required></textarea>
-            <button type="submit" class="btn-blue">自由メッセージを一斉配信する</button>
-        </form>
-    </div>
-</body>
-</html>
-"""
+def csrf_token():
+    if 'csrf' not in session:
+        session['csrf'] = secrets.token_hex(16)
+    return session['csrf']
+
+
+app.jinja_env.globals['csrf_token'] = csrf_token
+
+
+def check_csrf():
+    sent = request.form.get('csrf_token', '')
+    if not sent or not hmac.compare_digest(sent, session.get('csrf', '')):
+        abort(400)
+
+
+def build_plan(form):
+    """ フォーム内容から配信プランを作る。(エラー文 or None, プラン or None) """
+    kind = form.get('form_type')
+
+    if kind == 'deal':
+        category = form.get('category', '')
+        site_name = form.get('site_name', '')
+        title = form.get('title', '').strip()
+        price_info = form.get('price_info', '').strip()
+        url = form.get('url', '').strip()
+
+        if category not in CATEGORIES:
+            return "カテゴリーが正しくありません", None
+        if site_name and site_name not in SITES:
+            return "購入サイトが正しくありません", None
+        if not (title and price_info and url.startswith(("http://", "https://"))):
+            return "入力内容を確認してください（URLはhttp(s)://から）", None
+
+        user_ids = get_users_for_categories([category])
+        if not user_ids:
+            return f"「{category}」の登録者がいません", None
+
+        text = build_deal_text(category, title, price_info, url, site_name)
+        return None, {
+            'kind': 'deal', 'is_all': False,
+            'target_label': category,
+            'user_ids': user_ids, 'count': len(user_ids), 'count_note': '',
+            'text': text,
+            'meta': {'site_name': site_name, 'title': title,
+                     'body': price_info, 'url': url},
+        }
+
+    if kind == 'free':
+        mode = form.get('target_mode', '')
+        body = form.get('message_body', '').strip()
+        if not body:
+            return "メッセージ本文を入力してください", None
+        if len(body) > LINE_TEXT_MAX:
+            return f"本文が長すぎます（最大{LINE_TEXT_MAX}文字）", None
+
+        if mode == 'all':
+            count, db_count, api_count = estimate_all_count()
+            note = f"目安（登録済み {db_count} 名"
+            note += f"／友だち数API {api_count} 名）" if api_count is not None else "／友だち数APIは取得不可）"
+            return None, {
+                'kind': 'free', 'is_all': True,
+                'target_label': '全員',
+                'user_ids': None, 'count': count, 'count_note': note,
+                'text': body, 'meta': {'body': body},
+            }
+
+        if mode == 'categories':
+            selected = []
+            for c in form.getlist('target_categories'):
+                if c in CATEGORIES and c not in selected:
+                    selected.append(c)
+            if not selected:
+                return "カテゴリーを1つ以上選んでください", None
+            user_ids = get_users_for_categories(selected)
+            if not user_ids:
+                return "選んだカテゴリーの登録者がいません", None
+            return None, {
+                'kind': 'free', 'is_all': False,
+                'target_label': "、".join(selected),
+                'user_ids': user_ids, 'count': len(user_ids),
+                'count_note': '（複数カテゴリー登録者の重複は除外済み）' if len(selected) > 1 else '',
+                'text': body, 'meta': {'body': body},
+            }
+
+        return "配信対象を選んでください", None
+
+    return "不正なリクエストです", None
+
+
+def format_result(plan, success, failed):
+    count = "友だち全員" if success is None else f"{success} 名"
+    msg = f"✅「{plan['target_label']}」の対象者（{count}）に配信しました！"
+    if failed:
+        msg += f"　⚠️ 失敗: {failed} 件（通数上限などの可能性。ログを確認してください）"
+    return msg
+
 
 @app.route("/otoku-haishin-821", methods=['GET', 'POST'])
+@require_auth
 def admin_panel():
-    result_msg = None
     if request.method == 'POST':
-        form_type = request.form.get('form_type')
-        
-        if form_type == 'deal':
-            category = request.form.get('category')
-            site_name = request.form.get('site_name', '')
-            title = request.form.get('title')
-            price_info = request.form.get('price_info')
-            url = request.form.get('url')
-            
-            sent_count = broadcast_deal_to_category(category, title, price_info, url, site_name)
-            site_disp = f"（{site_name}）" if site_name else ""
-            result_msg = f"✅「{category}」{site_disp}を登録している {sent_count} 名に商品セールを配信しました！"
-            
-        elif form_type == 'free':
-            target_category = request.form.get('target_category')
-            message_body = request.form.get('message_body')
-            
-            sent_count = broadcast_free_message(target_category, message_body)
-            count_text = sent_count if isinstance(sent_count, str) else f"{sent_count} 名"
-            result_msg = f"✅「{target_category}」の対象者（{count_text}）に自由メッセージを配信しました！"
-        
-    return render_template_string(ADMIN_HTML, categories=CATEGORIES, result_msg=result_msg)
+        check_csrf()
+        step = request.form.get('step', 'preview')
+
+        error, plan = build_plan(request.form)
+        if error:
+            flash(f"⚠️ {error}", "error")
+            return redirect(url_for('admin_panel'))
+
+        fields = [(k, v) for k, v in request.form.items(multi=True)
+                  if k not in ('step', 'csrf_token', 'confirm_text')]
+
+        # ステップ1：確認画面（対象人数・残り通数を表示）
+        if step == 'preview':
+            quota = get_quota_info()
+            after = None
+            short = False
+            if quota['ok'] and not quota['unlimited']:
+                after = quota['remaining'] - plan['count']
+                short = after < 0
+            return render_template(
+                'admin_confirm.html',
+                plan=plan, fields=fields, quota=quota,
+                after=after, short=short, confirm_word=ALL_CONFIRM_WORD
+            )
+
+        # ステップ2：送信確定
+        if step == 'send':
+            if plan['is_all'] and request.form.get('confirm_text', '').strip() != ALL_CONFIRM_WORD:
+                flash(f"⚠️ 全員配信は確認ワード「{ALL_CONFIRM_WORD}」の入力が必要です。送信していません。", "error")
+                return redirect(url_for('admin_panel'))
+            success, failed = deliver(plan)
+            flash(format_result(plan, success, failed), "error" if failed else "ok")
+            return redirect(url_for('admin_panel'))
+
+        abort(400)
+
+    return render_template(
+        'admin.html',
+        categories=CATEGORIES,
+        sites=SITES,
+        quota=get_quota_info(),
+        user_count=count_users(),
+        deliveries=get_recent_deliveries()
+    )
 
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    # 本番は gunicorn 等を使用: gunicorn -w 2 -b 127.0.0.1:5000 app:app
+    app.run(host="127.0.0.1", port=5000, debug=False)
